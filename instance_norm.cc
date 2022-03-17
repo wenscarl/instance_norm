@@ -62,6 +62,8 @@ void InstanceNormGradCPU(const T* dy, const T* x, const U* gamma, const int N, c
 
     cache_mean[j] = mean;
     cache_ivar[j] = ivar;
+    printf("cpp mean=:%10.8f",mean);
+    printf("cpp ivar=:%10.8f",ivar);
   }
 
   // Compute dgamma, dbeta.

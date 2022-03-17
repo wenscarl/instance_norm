@@ -21,7 +21,7 @@ void InstanceNormCPU(const T* x, const U* gamma, const U* beta, const int N, con
       sum += curr;
     }
     mean = sum / D;
- //   printf("cpp mean: %10.8f\n", mean);
+ //   printf("cpp mean: %10.6f\n", mean);
     U sum_ivar = 0;
     for (int i = 0; i < D; i++) {
       U curr = GetAs<T, U>(x, j * D + i);
@@ -29,7 +29,7 @@ void InstanceNormCPU(const T* x, const U* gamma, const U* beta, const int N, con
     }
     ivar = 1.0 / sqrt(sum_ivar / D + epsilon);
 
-//    printf("cpp ivar: %10.8f\n", ivar);
+  //  printf("cpp ivar: %10.6f\n", ivar);
     for (int i = 0; i < D; i++) {
       U curr = GetAs<T, U>(x, j * D + i);
       y[j * D + i] = static_cast<T>((curr - mean) * ivar * gamma_ch + beta_ch);
@@ -42,6 +42,7 @@ void InstanceNormGradCPU(const T* dy, const T* x, const U* gamma, const int N, c
                       const int D, const U epsilon, U* dgamma, U* dbeta,
                       T* dx) {
   int NxC = N*C;
+  // printf("ssssssssssssssssssssssssssssssssssssssssssssss %d\n",NxC);
   U* cache_mean = new U[NxC];
   U* cache_ivar = new U[NxC];
   for (int j = 0; j < NxC; j++) {
@@ -63,7 +64,7 @@ void InstanceNormGradCPU(const T* dy, const T* x, const U* gamma, const int N, c
     cache_mean[j] = mean;
     cache_ivar[j] = ivar;
    
- //   printf("cpp ivar: %10.8f\n", ivar);
+//   printf("cpp ivar: %10.8f\n", ivar);
   }
 
 
@@ -79,7 +80,8 @@ void InstanceNormGradCPU(const T* dy, const T* x, const U* gamma, const int N, c
       }
     }
     
-   // printf("cpp dbeta: %10.8f\n", dbeta[i]);
+  //  printf("cpp dbeta: %10.8f\n", dbeta[i]);
+  //  printf("cpp dgamma: %10.8f\n", dgamma[i]);
   }
 
   // Compute dx.
