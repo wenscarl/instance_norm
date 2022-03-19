@@ -53,14 +53,14 @@ def ref_instance_norm_all_np(input, gamma, beta, gout, eps):
 
 # (N, C, D)
 # gamma, beta (1, C, 1)
-def instance_norm_np(x, gamma, beta, epsilon):
+def instance_norm_np(x, gamma, beta, epsilon, is_channel_first):
   assert len(x.shape) == 3
-  D_axis = (2, )
+  D_axis = (2, ) if is_channel_first else (1, )
 
   mean = np.mean(x, axis=D_axis, keepdims=True)
   var = np.var(x, axis=D_axis, keepdims=True)
 
- # print("NP: mean=", mean)
+  #print("NP: mean=", mean)
   x_mean = x - mean
   ivar = 1. / np.sqrt(var + epsilon)
  # print("NP: ivar=", ivar)
@@ -74,9 +74,10 @@ def instance_norm_np(x, gamma, beta, epsilon):
 
   return y, cache
 
-def instance_norm_grad_np(dy, gamma, cache):
+def instance_norm_grad_np(dy, gamma, cache, is_channel_first):
   N_axis = (0, )
-  D_axis = (2, )
+  D_axis = (2, ) if is_channel_first else (1, )
+  C_axis = (1, ) if is_channel_first else (2, )
   ND_axis = N_axis + D_axis
 
   D = 1
@@ -180,3 +181,4 @@ input_shapes = [
 if __name__ == "__main__":
   for input_shape in input_shapes:
     evaluate_np(input_shape)
+

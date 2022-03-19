@@ -30,7 +30,7 @@ def instance_norm_tf(x, gamma, beta, epsilon):
 def benchmark_tf(input_shape):
   assert len(input_shape) == 3
   warmup = 10
-  repeat = 100
+  repeat = 10
   channel_axis = 1
   layer = tfa.layers.InstanceNormalization(axis=channel_axis)
 
@@ -42,7 +42,7 @@ def benchmark_tf(input_shape):
     dx, (dgamma, dbeta) = tape.gradient(loss, [x, layer.variables])
     return dx, dgamma, dbeta
 
-  data = tf.random.normal(input_shape)
+  data = tf.random.normal(input_shape,dtype=tf.dtypes.float16)
 
   for i in range(warmup):
     dx, dgamma, dbeta = train_step(data)
@@ -57,7 +57,13 @@ def benchmark_tf(input_shape):
   print("Time: {:0.2f} ms".format(1000 * result / repeat))
 
 input_shapes = [
-   (3, 4, 5),
+   #(3, 4, 5),
+   (10, 64, 1000000),
+   (100, 64, 100000),
+   (1000, 64, 10000),
+   (10000, 64, 1000),
+   (100000, 64, 100),
+   (1000000, 64, 10),
   #  (10, 100, 100000),
   #  (100, 100, 10000),
   #  (1000, 100, 1000),
