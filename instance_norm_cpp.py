@@ -76,9 +76,9 @@ def evaluate_cpp(input_shape_raw, rtol=1e-3, atol=1e-3,is_channel_first=True):
       dy.ctypes.data_as(POINTER(c_float)),
       x.ctypes.data_as(POINTER(c_float)),
       gamma.ctypes.data_as(POINTER(c_float)),
-      c_int(input_shape[0]),
-      c_int(input_shape[1]),
-      c_int(input_shape[2]),
+      c_int(dim_N),
+      c_int(dim_C),
+      c_int(dim_D),
       c_float(epsilon),
       dx_cpp.ctypes.data_as(POINTER(c_float)),
       dgamma_cpp.ctypes.data_as(POINTER(c_float)),
@@ -94,7 +94,7 @@ input_shapes = [
   # N, C, D always
   (2, 3, 4),
   (5, 4, 7),
-#   (10, 100, 100000),
+   (10, 100, 100),
 #   (100, 100, 10000),
 #   (1000, 100, 1000),
 #   (10000, 100, 100),
@@ -117,5 +117,6 @@ if __name__ == "__main__":
       evaluate_cpp(input_shape, 1e-2, 1e-1)
       continue
     evaluate_cpp(input_shape, is_channel_first=False)
+
 
 

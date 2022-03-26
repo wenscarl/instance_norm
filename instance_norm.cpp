@@ -11,7 +11,8 @@ U GetAs(const T* in, int offset) {
 
 template <typename T, typename U>
 void InstanceNormCPU(const T* x, const U* gamma, const U* beta, const int N, const int C,
-                  const int D, const U epsilon, T* y, const int is_channel_first) {
+                  const int D, const U epsilon, T* y, U* cache_mean_cpu, U* cache_ivar_cpu,
+                  const int is_channel_first) {
   LayOut layout = is_channel_first ? channel_first : channel_last;
 
   int NxC = N*C;
@@ -33,8 +34,8 @@ void InstanceNormCPU(const T* x, const U* gamma, const U* beta, const int N, con
       sum += curr;
     }
     mean = sum / D;
-
-   // printf("cpp mean=:%10.8f",mean);
+    cache_mean_cpu[j] = mean;
+  //  printf("cpp mean=:%10.8f",mean);
     U sum_ivar = 0;
     for (int i = 0; i < D; i++) {
       if (layout == channel_last) {
@@ -46,7 +47,8 @@ void InstanceNormCPU(const T* x, const U* gamma, const U* beta, const int N, con
       sum_ivar += (curr - mean) * (curr - mean);
     }
     ivar = 1.0 / sqrt(sum_ivar / D + epsilon);
- //   printf("cpp ivar=:%10.8f\n",ivar);
+    cache_ivar_cpu[j] = ivar;
+  //  printf("cpp ivar=:%10.8f\n",ivar);
     for (int i = 0; i < D; i++) {
       U curr;
      // mean = 0; 
@@ -124,8 +126,8 @@ void InstanceNormGradCPU(const T* dy, const T* x, const U* gamma, const int N, c
           idx = j * CxD + i * D + k;
         }
         U dy_curr = static_cast<U>(dy[idx]);
-        dgamma[i] += dy_curr * (x[idx] - cache_mean[j * C + i]) * cache_ivar[ j * C + i];
-        dbeta[i] += dy_curr;
+        dgamma[i] += dy_curr* (x[idx] - cache_mean[ j * C + i]) * cache_ivar[ j * C + i];
+        dbeta[i] +=  dy_curr;
       }
     }
   }
@@ -205,8 +207,8 @@ void Print2DHost(const T* x, int N, int C, int D, std::string msg) {
 extern "C" {
 void instance_norm(const float* x, const float* gamma, const float* beta,
                 const int N, const int C, const int D, const float epsilon,
-                 float* y, const int is_channel_first) {
-  InstanceNormCPU(x, gamma, beta, N, C, D, epsilon, y,is_channel_first);
+                 float* y, float *mean, float* ivar,  const int is_channel_first) {
+  InstanceNormCPU(x, gamma, beta, N, C, D, epsilon, y, mean, ivar, is_channel_first);
 }
 
 void instance_norm_grad(const float* dy, const float* x, const float* gamma,
@@ -224,5 +226,6 @@ void print_2d(const float* x, int N, int C, int D, std::string msg) {
   Print2DHost(x, N, C, D, msg);
 }
 }
+
 
 
