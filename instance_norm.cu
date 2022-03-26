@@ -12,6 +12,13 @@
     }                                                                          \
   }
 
+#define min(a, b)                                                              \
+  ({                                                                           \
+    __typeof__(a) _a = (a);                                                    \
+    __typeof__(b) _b = (b);                                                    \
+    _a < _b ? _a : _b;                                                         \
+  })
+
 template <typename T>
 void IsClose2DHost(const T *x, const T *y, int N, int C, int D, std::string msg,
                    float atol, float rtol);
@@ -63,7 +70,8 @@ void InstanceNormGradCPUHelper(const T *dy, const T *x, const U *gamma,
   T *dy_h = new T[N * C * D];
   T *x_h = new T[N * C * D];
   U *gamma_h = new U[C];
-  checkCUDA(cudaMemcpy(dy_h, dy, N * C * D * sizeof(T), cudaMemcpyDeviceToHost));
+  checkCUDA(
+      cudaMemcpy(dy_h, dy, N * C * D * sizeof(T), cudaMemcpyDeviceToHost));
   checkCUDA(cudaMemcpy(x_h, x, N * C * D * sizeof(T), cudaMemcpyDeviceToHost));
   checkCUDA(cudaMemcpy(gamma_h, gamma, C * sizeof(U), cudaMemcpyDeviceToHost));
 
@@ -81,7 +89,7 @@ void InstanceNormGradCPUHelper(const T *dy, const T *x, const U *gamma,
   delete[] gamma_h;
 }
 
-const int kBlockSize = 256;
+const int kBlockSize = 128;
 const int kWarpSize = 32;
 
 int DivUp(int a, int b) { return (a + b - 1) / b; }
@@ -136,9 +144,14 @@ __host__ __device__ U GetAs(const T *__restrict__ in, int offset) {
 ///////////////////////////// MAYBE inspect
 template <typename T, typename U> struct MeanOp {
   int D;
-  int C = -1; //C==-1 indicating NCD
+  int C = -1; // C==-1 indicating NCD
   __device__ U Compute(const T *x, const int &row, const int &col) const {
-    int idx = (C == -1) ? row * D + col : (row/C) * C * D + col*C+ row%C;
+    int idx = (C == -1) ? row * D + col : (row / C) * C * D + col * C + row % C;
+    return GetAs<T, U>(x, idx);
+  }
+  __device__ U Compute_ndc(const T *x, const int &row, const int &col,
+                           const int &z) const {
+    int idx = row * C * D + col * C + z;
     return GetAs<T, U>(x, idx);
   }
   __device__ U Finalize(const U &sum) const { return sum / D; }
@@ -148,16 +161,24 @@ template <typename T, typename U> struct IvarOp {
   const U *cache_mean;
   U epsilon;
   int D;
-  int C=-1; // C==-1 indicating NCD
+  int C = -1; // C==-1 indicating NCD
   __device__ U Compute(const T *x, const int &row, const int &col,
-                       const U& mean) const {
-    int idx = (C == -1) ? row * D + col : (row/C) * C * D + col*C+ row%C;
+                       const U &mean) const {
+    int idx = (C == -1) ? row * D + col : (row / C) * C * D + col * C + row % C;
     U curr = GetAs<T, U>(x, idx);
     return (curr - mean) * (curr - mean);
   }
   __device__ U Compute(const T *x, const int &row, const int &col) const {
     return Compute(x, row, col, cache_mean[row]);
   }
+  __device__ U Compute_ndc(const T *x, const int &row, const int &col,
+                           const int &z) const {
+    int idx = row * C * D + col * C + z;
+    U curr = GetAs<T, U>(x, idx);
+    U m = cache_mean[row * C + z];
+    return (curr - m) * (curr - m);
+  }
+
   __device__ U Finalize(const U &sum) const { return rsqrt(sum / D + epsilon); }
 };
 
@@ -205,24 +226,26 @@ template <typename T, typename U> struct DxOp {
   const U *dl_dmus;
   int C;
   int D;
-  __device__ T Compute(const T *dy, const int& idx, const int is_channel_first) const {
+  __device__ T Compute(const T *dy, const int &idx,
+                       const int is_channel_first) const {
     U curr = GetAs<T, U>(dy, idx);
     U dl_dx;
-    if (is_channel_first) { //NCD
+    if (is_channel_first) { // NCD
       int row = idx / D;
       U dl_di = curr * gamma[row % C] * cache_ivar[row];
       U di_dx = 1.;
       U dvar_dx = 2. * (x[idx] - cache_mean[row]) / D;
       U dmu_dx = 1. / D;
       dl_dx = dl_di * di_dx + dl_dvars[row] * dvar_dx + dl_dmus[row] * dmu_dx;
-    } else { //NDC
+    } else { // NDC
       int col = idx % C;
       int cache_idx = idx / (C * D) * C + idx % C;
       U dl_di = curr * gamma[col] * cache_ivar[cache_idx];
       U di_dx = 1.;
       U dvar_dx = 2. * (x[idx] - cache_mean[cache_idx]) / D;
       U dmu_dx = 1. / D;
-      dl_dx = dl_di * di_dx + dl_dvars[cache_idx] * dvar_dx + dl_dmus[cache_idx] * dmu_dx;
+      dl_dx = dl_di * di_dx + dl_dvars[cache_idx] * dvar_dx +
+              dl_dmus[cache_idx] * dmu_dx;
     }
     return static_cast<T>(dl_dx);
   }
@@ -235,7 +258,8 @@ template <typename T, typename U> struct YOp {
   const U *beta;
   int C;
   int D;
-  __device__ T Compute(const T *x, const int &idx, const int is_channel_first) const {
+  __device__ T Compute(const T *x, const int &idx,
+                       const int is_channel_first) const {
     U curr = GetAs<T, U>(x, idx);
     int gb_idx, cache_idx;
     if (is_channel_first) {
@@ -248,13 +272,14 @@ template <typename T, typename U> struct YOp {
     U mean = cache_mean[cache_idx];
     U ivar = cache_ivar[cache_idx];
     return static_cast<T>((curr - mean) * ivar * gamma[gb_idx] + beta[gb_idx]);
+    // return static_cast<T>((curr) * gamma[gb_idx] + beta[gb_idx]);
   }
 };
 
 template <typename T, typename Op>
 __global__ void InstanceNormUpdate(const T *__restrict__ in, const int N,
                                    const int D, T *out, Op op,
-                                   const int is_channel_first=1) {
+                                   const int is_channel_first = 1) {
   const int tid = threadIdx.x + blockIdx.x * blockDim.x;
 
   if (tid >= N)
@@ -278,11 +303,11 @@ void InstanceNormGPU(const T *x, const U *gamma, const U *beta, const U epsilon,
   bool use_single_block =
       (D <= min_num_blocks * kBlockSize * min_workload_per_thread);
   printf("InstanceNormGPU use_single_block=%d\n", use_single_block);
-  
+
   int maybe_channel_dim = is_channel_first ? -1 : C;
   MeanOp<T, U> mean_ops{D, maybe_channel_dim};
   IvarOp<T, U> ivar_ops{cache_mean, epsilon, D, maybe_channel_dim};
-  
+
   cudaEventRecord(start);
   int NxC = N * C;
   if (use_single_warp) {
@@ -292,35 +317,73 @@ void InstanceNormGPU(const T *x, const U *gamma, const U *beta, const U epsilon,
     InstanceNormRowReduceInToOutWarp<<<DivUp(NxC, kBlockSize / kWarpSize),
                                        kBlockSize>>>(
         x, N, C, D, cache_mean, cache_ivar, mean_ops, ivar_ops);
-  } else if (use_single_block) {
-    printf("XLOG: Mean/Var -> single-block per row\n");
-    InstanceNormRowReduceInToOut<<<N, kBlockSize>>>(
-        x, N, C, D, cache_mean, cache_ivar, mean_ops, ivar_ops, is_channel_first);
-  } else {
+  }
+  //  else if (use_single_block ) {
+  //   printf("XLOG: Mean/Var -> single-block per row\n");
+  //   InstanceNormRowReduceInToOut<<<N, kBlockSize>>>(
+  //       x, N, C, D, cache_mean, cache_ivar, mean_ops, ivar_ops,
+  //       is_channel_first);
+  // }
+  else {
     printf("XLOG: Mean/Var -> multi-block per row\n");
     const int blocks_per_row = DivUp(D, kBlockSize * min_workload_per_thread);
 
     float *temp_sum;
     float *temp_ivar;
-    PrepareAlloc(&temp_sum, N * C * blocks_per_row);
-    PrepareAlloc(&temp_ivar, N * C * blocks_per_row);
+    printf("XLOG: I am %d !\b", is_channel_first);
+    if (is_channel_first) {
+      PrepareAlloc(&temp_sum, N * C * blocks_per_row);
+      PrepareAlloc(&temp_ivar, N * C * blocks_per_row);
+      dim3 threads(kBlockSize, 1, 1);
+      dim3 blocks(blocks_per_row, N, 1);
+      printf("XLOG: num_blocks per row=%d\n", blocks.x);
+      // For long rows, we launch n blocks to process each row. The intermediate
+      // results are stored in a temp memory with the size of N*n. Then, we
+      // launch single block to handle each row of the temp memory.
+      InstanceNormRowReduceInToTemp<<<blocks, threads>>>(
+          x, N, C, D, temp_sum, mean_ops, is_channel_first);
+      InstanceNormRowReduceTempToOut<<<N * C, threads>>>(
+          temp_sum, N, C, blocks_per_row, cache_mean, mean_ops);
 
-    dim3 threads(kBlockSize, 1, 1);
-    dim3 blocks(blocks_per_row, N, 1);
-    printf("XLOG: num_blocks per row=%d\n", blocks.x);
+      InstanceNormRowReduceInToTemp<<<blocks, threads>>>(
+          x, N, C, D, temp_ivar, ivar_ops, is_channel_first);
+      InstanceNormRowReduceTempToOut<<<N * C, threads>>>(
+          temp_ivar, N, C, blocks_per_row, cache_ivar, ivar_ops);
+    } else {
+      int thd_x = min(N * C, kBlockSize);
+      int thd_y = kBlockSize / thd_x;
+      int min_workload_per_thread = 10000;
+      const int blocks_per_row =
+          DivUp(D, thd_y * min_workload_per_thread);
 
-    // For long rows, we launch n blocks to process each row. The intermediate
-    // results are stored in a temp memory with the size of N*n. Then, we launch
-    // single block to handle each row of the temp memory.
-    InstanceNormRowReduceInToTemp<<<blocks, threads>>>(x, N, C, D, temp_sum,
-                                                       mean_ops);
-    InstanceNormRowReduceTempToOut<<<N * C, threads>>>(
-        temp_sum, N, C, blocks_per_row, cache_mean, mean_ops);
+      dim3 threads(thd_x, thd_y);
+      dim3 blocks(DivUp(N * C, thd_x), blocks_per_row);
 
-    InstanceNormRowReduceInToTemp<<<blocks, threads>>>(x, N, C, D, temp_ivar,
-                                                       ivar_ops);
-    InstanceNormRowReduceTempToOut<<<N * C, threads>>>(
-        temp_ivar, N, C, blocks_per_row, cache_ivar, ivar_ops);
+      PrepareAlloc(&temp_sum, N * C * blocks_per_row * thd_y);
+      PrepareAlloc(&temp_ivar, N * C * blocks_per_row * thd_y);
+
+      printf("XLOG: Mean/Var -> multi-block per row\n");
+      printf("XLOG: in NDC, num_blocks per row=%d\n", blocks_per_row);
+      printf("XLOG: thread.XYZ=%d, %d, %d\n", threads.x, threads.y, threads.z);
+      printf("XLOG: blocks.XYZ=%d, %d, %d\n", blocks.x, blocks.y, blocks.z);
+
+      // For long rows, we launch n blocks to process each row. The intermediate
+      // results are stored in a temp memory with the size of N*n. Then, we
+      // launch single block to handle each row of the temp memory.
+      printf("before entering!\n");
+      dim3 threads2(kBlockSize, 1, 1);
+      dim3 blocks2(blocks_per_row, N, 1);
+      InstanceNormRowReduceInToTemp2<<<blocks, threads>>>(
+          x, N, C, D, blocks_per_row, temp_sum, mean_ops, is_channel_first);
+      InstanceNormRowReduceTempToOut<<<N * C, threads2>>>(
+          temp_sum, N, C, blocks_per_row * thd_y, cache_mean, mean_ops);
+
+      InstanceNormRowReduceInToTemp2<<<blocks, threads>>>(
+          x, N, C, D, blocks_per_row, temp_ivar, ivar_ops, is_channel_first);
+      InstanceNormRowReduceTempToOut<<<N * C, threads2>>>(
+          temp_ivar, N, C, blocks_per_row * thd_y, cache_ivar, ivar_ops);
+      printf("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n");
+    }
 
     checkCUDA(cudaFree(temp_ivar));
     checkCUDA(cudaFree(temp_sum));
@@ -333,9 +396,8 @@ void InstanceNormGPU(const T *x, const U *gamma, const U *beta, const U epsilon,
 
   cudaEventRecord(start);
   YOp<T, U> y_ops{cache_mean, cache_ivar, gamma, beta, C, D};
-  InstanceNormUpdate<<<DivUp(N * C * D, kBlockSize), kBlockSize>>>(x, N * C * D,
-                                                                   D, y, y_ops,
-								   is_channel_first);
+  InstanceNormUpdate<<<DivUp(N * C * D, kBlockSize), kBlockSize>>>(
+      x, N * C * D, D, y, y_ops, is_channel_first);
   cudaEventRecord(stop);
 
   cudaEventSynchronize(stop);
@@ -432,36 +494,62 @@ __global__ void InstanceNormBetaGammaRowReduceInToTemp(
     const T *__restrict__ x, const T *__restrict__ dy,
     const U *__restrict__ cache_mean, const U *__restrict__ cache_ivar,
     const int N, const int C, const int D, U *__restrict__ temp_dbeta,
-    U *__restrict__ temp_dgamma, const int is_channel_first=true) {
-  typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
-  __shared__ typename BlockReduce::TempStorage temp_storage;
+    U *__restrict__ temp_dgamma, const int is_channel_first = true) {
 
-  const int row_offset = threadIdx.x + blockIdx.x * blockDim.x;
-  int NxD = N * D;
-  int CxD = C * D;
-  int glb_id, cache_idx;
-  for (int col_idx = blockIdx.y; col_idx < C; col_idx += gridDim.y) {
+  if (is_channel_first) {
+    typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+
+    const int row_offset = threadIdx.x + blockIdx.x * blockDim.x;
+    int NxD = N * D;
+    int CxD = C * D;
+    int glb_id, cache_idx;
+    for (int col_idx = blockIdx.y; col_idx < C; col_idx += gridDim.y) {
+      U partial_sum_dbeta = 0;
+      U partial_sum_dgamma = 0;
+      for (int i = row_offset; i < NxD; i += gridDim.x * blockDim.x) {
+        glb_id = (i / D) * CxD + col_idx * D + i % D;
+        cache_idx = i / D * C + col_idx;
+        U curr = dy[glb_id];
+        partial_sum_dbeta += curr;
+        partial_sum_dgamma +=
+            curr * (x[glb_id] - cache_mean[cache_idx]) * cache_ivar[cache_idx];
+      }
+      U sum_dbeta = BlockReduce(temp_storage).Sum(partial_sum_dbeta);
+      U sum_dgamma = BlockReduce(temp_storage).Sum(partial_sum_dgamma);
+      if (threadIdx.x == 0) {
+        temp_dbeta[col_idx * gridDim.x + blockIdx.x] = sum_dbeta;
+        temp_dgamma[col_idx * gridDim.x + blockIdx.x] = sum_dgamma;
+      }
+    }
+  } else {
+    // blocks: 1 , n_rows, 1
+    // 64 thds
+    typedef cub::BlockReduce<U, 64> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+
+    const int row_offset = threadIdx.x + blockIdx.x * blockDim.x;
+    const int col_offset = threadIdx.y + blockIdx.y * blockDim.y;
+    int NxD = N * D;
+    int CxD = C * D;
+    int glb_id, cache_idx;
     U partial_sum_dbeta = 0;
     U partial_sum_dgamma = 0;
-    for (int i = row_offset; i < NxD; i += gridDim.x * blockDim.x) {
-      if (is_channel_first) {
-        glb_id = (i / D) * CxD + col_idx * D + i % D;
-      } else {
-        glb_id = i * C + col_idx;
-      }
 
-      cache_idx = i / D * C + col_idx;
-      U curr = dy[glb_id];
-      partial_sum_dbeta += curr;
-      partial_sum_dgamma +=
-          curr * (x[glb_id] - cache_mean[cache_idx]) * cache_ivar[cache_idx];
+    for (int i = col_offset; i < NxD; i += gridDim.y * blockDim.y) {
+
+      for (int row_idx = row_offset; row_idx < C; row_idx += gridDim.x) {
+        glb_id = i * C + row_idx;
+        cache_idx = i / D * C + row_idx;
+        U curr = dy[glb_id];
+        partial_sum_dbeta += curr;
+        partial_sum_dgamma +=
+            curr * (x[glb_id] - cache_mean[cache_idx]) * cache_ivar[cache_idx];
+      }
     }
-    U sum_dbeta = BlockReduce(temp_storage).Sum(partial_sum_dbeta);
-    U sum_dgamma = BlockReduce(temp_storage).Sum(partial_sum_dgamma);
-    if (threadIdx.x == 0) {
-      temp_dbeta[col_idx * gridDim.x + blockIdx.x] = sum_dbeta;
-      temp_dgamma[col_idx * gridDim.x + blockIdx.x] = sum_dgamma;
-    }
+
+    temp_dbeta[row_offset * gridDim.y + blockIdx.y] = partial_sum_dbeta;
+    temp_dgamma[row_offset * gridDim.y + blockIdx.y] = partial_sum_dgamma;
   }
 }
 
@@ -483,13 +571,16 @@ __global__ void InstanceNormGradBetaGammaIntoTemp(
   for (int i = blockIdx.y * rows; i < min(blockIdx.y * rows + rows, NxD); i++) {
     int in = i / D;
     int id = i % D;
+    // NCD
     U dy_curr = GetAs<T, U>(dy, in * C * D + tid * D + id);
     sum_dgamma += dy_curr *
                   (x[in * C * D + tid * D + id] - cache_mean[in * C + tid]) *
                   cache_ivar[in * C + tid];
-    //   U dy_curr = GetAs<T, U>(dy, tid  + i * C);
-    //   sum_dgamma += dy_curr * (x[tid  + i*C] - cache_mean[in + tid*N]) *
-    //   cache_ivar[in + tid*N];
+    // NDC
+    //       U dy_curr = GetAs<T, U>(dy, tid  + i * C);
+    //       sum_dgamma += dy_curr * (x[tid  + i*C] - cache_mean[in + tid*N]) *
+    //       cache_ivar[in + tid*N];
+
     sum_dbeta += dy_curr;
   }
   tgamma[blockIdx.y * C + j] = sum_dgamma;
@@ -578,20 +669,37 @@ void InstanceNormGradGPU(const T *dy, const T *x, const U *cache_mean,
     float *temp_dbeta;
     PrepareAlloc(&temp_dgamma, reduced_rows * C);
     PrepareAlloc(&temp_dbeta, reduced_rows * C);
-    //   A inefficient implementation
-    //    dim3 blocks(DivUp(C, kBlockSize), reduced_rows);
-    //    printf("XLOG: num_blocks per column=%d\n", blocks.y);
-    //    InstanceNormGradBetaGammaIntoTemp<<<blocks, kBlockSize>>>(
-    //        dy, x, cache_mean, cache_ivar, N, C, D, min_rows_per_block,
-    //        temp_dgamma, temp_dbeta);
-    dim3 blocks(reduced_rows, reduced_cols, 1);
+    //       A inefficient implementation
+    dim3 blocks(DivUp(C, kBlockSize), reduced_rows);
     printf("XLOG: num_blocks per column=%d\n", blocks.y);
-    InstanceNormBetaGammaRowReduceInToTemp<<<blocks, kBlockSize>>>(
-        x, dy, cache_mean, cache_ivar, N, C, D, temp_dbeta, temp_dgamma,
-        is_channel_first);
-
+    InstanceNormGradBetaGammaIntoTemp<<<blocks, kBlockSize>>>(
+        dy, x, cache_mean, cache_ivar, N, C, D, min_rows_per_block, temp_dgamma,
+        temp_dbeta);
     InstanceNormGradBetaGammaTempToOut<<<DivUp(C, kBlockSize), kBlockSize>>>(
         temp_dgamma, temp_dbeta, C, reduced_rows, dgamma, dbeta);
+
+    //    if (is_channel_first) {
+    //       dim3 blocks(reduced_rows, reduced_cols, 1);
+    //       printf("XLOG: num_blocks per column=%d\n", blocks.y);
+    //      InstanceNormBetaGammaRowReduceInToTemp<<<blocks, kBlockSize>>>(
+    //          x, dy, cache_mean, cache_ivar, N, C, D, temp_dbeta, temp_dgamma,
+    //          is_channel_first);
+    //              InstanceNormGradBetaGammaTempToOut<<<DivUp(C, kBlockSize),
+    //              kBlockSize>>>(
+    //        temp_dgamma, temp_dbeta, C, reduced_rows, dgamma, dbeta);
+    //    } else {
+    //      const int reduced_rows = DivUp(N * D, 100000);
+    //       dim3 blocks(1, reduced_rows, 1);
+    //       printf("XLOG: num_blocks per column=%d\n", blocks.y);
+    //      InstanceNormBetaGammaRowReduceInToTemp<<<blocks, 256>>>(
+    //          x, dy, cache_mean, cache_ivar, N, C, D, temp_dbeta, temp_dgamma,
+    //          is_channel_first);
+    //            InstanceNormGradBetaGammaTempToOut<<<DivUp(C, kBlockSize),
+    //            kBlockSize>>>(
+    //        temp_dgamma, temp_dbeta, C, reduced_rows, dgamma, dbeta);
+    //    }
+
+
 
     checkCUDA(cudaFree(temp_dgamma));
     checkCUDA(cudaFree(temp_dbeta));
@@ -693,8 +801,8 @@ void InstanceNormGradGPU(const T *dy, const T *x, const U *cache_mean,
   cudaEventRecord(start);
   DxOp<T, U> dx_ops{x, cache_mean, cache_ivar, gamma, temp_1, temp_2, C, D};
 
-  InstanceNormUpdate<<<DivUp(NxC * D, kBlockSize), kBlockSize>>>(dy, NxC * D, D,
-                                                                 dx, dx_ops, is_channel_first);
+  InstanceNormUpdate<<<DivUp(NxC * D, kBlockSize), kBlockSize>>>(
+      dy, NxC * D, D, dx, dx_ops, is_channel_first);
   cudaEventRecord(stop);
 
   cudaEventSynchronize(stop);
@@ -755,7 +863,7 @@ template <typename T, typename U, typename Op1, typename Op2>
 __global__ void
 InstanceNormRowReduceInToOut(const T *__restrict__ in, const int N, const int C,
                              const int D, U *out1, U *out2, Op1 op1, Op2 op2,
-                             const bool is_channel_first=true) {
+                             const bool is_channel_first = true) {
   const int tid = threadIdx.x;
 
   typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
@@ -767,7 +875,7 @@ InstanceNormRowReduceInToOut(const T *__restrict__ in, const int N, const int C,
   for (int k = blockIdx.x; k < N * C; k += gridDim.x) {
     U partial_sum = 0;
     for (int i = tid; i < D; i += kBlockSize) {
-      partial_sum += op1.Compute(in, k, i); 
+      partial_sum += op1.Compute(in, k, i);
     }
 
     U sum = BlockReduce(temp_storage.reduce).Sum(partial_sum);
@@ -793,23 +901,59 @@ InstanceNormRowReduceInToOut(const T *__restrict__ in, const int N, const int C,
 }
 
 template <typename T, typename U, typename Op>
+__global__ void InstanceNormRowReduceInToTemp2(const T *__restrict__ x,
+                                               const int N, const int C,
+                                               const int D, const int bpr,
+                                               U *__restrict__ temp, Op op,
+                                               const int is_channel_first) {
+
+  const int col_offset = threadIdx.y + blockIdx.y * blockDim.y;
+  const int row_offset = threadIdx.x + blockIdx.x * blockDim.x;
+  if (row_offset >= N * C)
+    return;
+  U partial_sum = 0;
+  for (int y_idx = col_offset; y_idx < D; y_idx += blockDim.y * gridDim.y) {
+    partial_sum += op.Compute_ndc(x, row_offset / C, y_idx, row_offset % C);
+  }
+
+  temp[row_offset * bpr * blockDim.y + col_offset] = partial_sum;
+  //      if (threadIdx.y == 0 && col_offset < D){
+  //        temp[row_offset *bpr+blockIdx.y] = partial_sum;
+  //      }
+}
+
+template <typename T, typename U, typename Op>
 __global__ void
 InstanceNormRowReduceInToTemp(const T *__restrict__ x, const int N, const int C,
-                              const int D, U *__restrict__ temp, Op op) {
-  typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
-  __shared__ typename BlockReduce::TempStorage temp_storage;
+                              const int D, U *__restrict__ temp, Op op,
+                              const int is_channel_first = true) {
+  if (is_channel_first) {
+    //    printf("hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh\n");
+    typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
+    __shared__ typename BlockReduce::TempStorage temp_storage;
 
-  const int row_offset = threadIdx.x + blockIdx.x * blockDim.x;
+    const int row_offset = threadIdx.x + blockIdx.x * blockDim.x;
 
-  for (int row_idx = blockIdx.y; row_idx < N * C; row_idx += gridDim.y) {
+    for (int row_idx = blockIdx.y; row_idx < N * C; row_idx += gridDim.y) {
+      U partial_sum = 0;
+      for (int i = row_offset; i < D; i += gridDim.x * blockDim.x) {
+        partial_sum += op.Compute(x, row_idx, i);
+      }
+      U sum = BlockReduce(temp_storage).Sum(partial_sum);
+      if (threadIdx.x == 0) {
+        temp[row_idx * gridDim.x + blockIdx.x] = sum;
+      }
+    }
+  } else {
+    const int row_offset = threadIdx.x + blockIdx.x * blockDim.x;
+    const int col_offset = threadIdx.y + blockIdx.y * blockDim.y;
+    const int z_offset = threadIdx.z + blockIdx.z * blockDim.z;
+
     U partial_sum = 0;
-    for (int i = row_offset; i < D; i += gridDim.x * blockDim.x) {
-      partial_sum += op.Compute(x, row_idx, i);
+    for (int z_idx = z_offset; z_idx < D; z_idx += blockDim.z * gridDim.z) {
+      //      partial_sum += op.Compute(x, col_offset, z_idx, row_offset);
     }
-    U sum = BlockReduce(temp_storage).Sum(partial_sum);
-    if (threadIdx.x == 0) {
-      temp[row_idx * gridDim.x + blockIdx.x] = sum;
-    }
+    temp[col_offset * gridDim.x * blockDim.x + row_offset] = partial_sum;
   }
 }
 
@@ -843,12 +987,14 @@ int main(int argc, char **argv) {
   int D = 4;
   int allow_print = 0;
   int is_channel_first = 0;
+  int do_test = 0;
   if (argc >= 3) {
     N = atoi(argv[1]);
     C = atoi(argv[2]);
     D = atoi(argv[3]);
     allow_print = atoi(argv[4]);
     is_channel_first = atoi(argv[5]);
+    do_test = atoi(argv[6]);
   }
 
   DTYPE *x;
@@ -870,22 +1016,24 @@ int main(int argc, char **argv) {
                   is_channel_first);
   if (allow_print) {
     //   Print2D(x, N, C, D, "GPU x:");
-       Print2D(y, N, C, D, "GPU y:");
-     Print2D(cache_mean, N, C, 1, "GPU cache_mean:");
-     Print2D(cache_ivar, N, C, 1, "GPU cache_ivar:");
+    //     Print2D(y, N, C, D, "GPU y:");
+    Print2D(cache_mean, N, C, 1, "GPU cache_mean:");
+    Print2D(cache_ivar, N, C, 1, "GPU cache_ivar:");
   }
 
   DTYPE *y_h = new DTYPE[N * C * D];
- // InstanceNormCPUHelper(x, gamma, beta, N, C, D, epsilon, y_h, is_channel_first);
+  if (do_test)
+    InstanceNormCPUHelper(x, gamma, beta, N, C, D, epsilon, y_h,
+                          is_channel_first);
   if (allow_print) {
-      Print2DHost(y_h, N, C, D, "CPU y:");
+    //     Print2DHost(y_h, N, C, D, "CPU y:");
   }
   IsClose2D(y, y_h, N, C, D, "y");
   delete[] y_h;
   // ---- Forward Done Here ----
 
   DTYPE *dy;
-  PrepareAlloc(&dy, N * C * D, 0.001f);
+  PrepareAlloc(&dy, N * C * D, 1);
 
   DTYPE *dx;
   float *dgamma;
@@ -901,18 +1049,20 @@ int main(int argc, char **argv) {
   if (allow_print) {
     Print2D(dgamma, 1, 1, C, "GPU dgamma:");
     Print2D(dbeta, 1, 1, C, "GPU dbeta:");
-    Print2D(dx, N, C, D, "GPU dx:");
+    //   Print2D(dx, N, C, D, "GPU dx:");
     //    Print2D(dy, N, C, D, "GPU dy:");
   }
 
   DTYPE *dx_h = new DTYPE[N * C * D];
   float *dgamma_h = new float[C];
   float *dbeta_h = new float[C];
- //  InstanceNormGradCPUHelper(dy, x, gamma, N, C, D, epsilon, dgamma_h, dbeta_h, dx_h, is_channel_first);
+  if (do_test)
+    InstanceNormGradCPUHelper(dy, x, gamma, N, C, D, epsilon, dgamma_h, dbeta_h,
+                              dx_h, is_channel_first);
   if (allow_print) {
     Print2DHost(dgamma_h, 1, 1, C, "CPU dgamma:");
     Print2DHost(dbeta_h, 1, 1, C, "CPU dbeta:");
-    Print2DHost(dx_h, N, C, D, "CPU dx:");
+    //    Print2DHost(dx_h, N, C, D, "CPU dx:");
   }
 
   IsClose2D(dgamma, dgamma_h, 1, 1, C, "dgamma");
@@ -934,5 +1084,6 @@ int main(int argc, char **argv) {
   checkCUDA(cudaFree(dbeta));
   checkCUDA(cudaFree(cache_mean));
   checkCUDA(cudaFree(cache_ivar));
+  printf(
+      "###################################################################\n");
 }
-
