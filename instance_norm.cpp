@@ -35,7 +35,7 @@ void InstanceNormCPU(const T* x, const U* gamma, const U* beta, const int N, con
     }
     mean = sum / D;
     cache_mean_cpu[j] = mean;
-  //  printf("cpp mean=:%10.8f",mean);
+  //  printf("cpp mean=:%10.8f\n",mean);
     U sum_ivar = 0;
     for (int i = 0; i < D; i++) {
       if (layout == channel_last) {
@@ -109,8 +109,8 @@ void InstanceNormGradCPU(const T* dy, const T* x, const U* gamma, const int N, c
 
     cache_mean[j] = mean;
     cache_ivar[j] = ivar;
-   // printf("cpp mean=:%10.8f\n",mean);
-   // printf("cpp ivar=:%10.8f\n",ivar);
+  //  printf("cpp mean=:%10.8f\n",mean);
+  //  printf("cpp ivar=:%10.8f\n",ivar);
   }
 
   // Compute dgamma, dbeta.
@@ -165,7 +165,7 @@ void InstanceNormGradCPU(const T* dy, const T* x, const U* gamma, const int N, c
       U dmean_dx = 1. / D;
 
       U dl_dx = dl_di * di_dx + dl_dvar * dvar_dx + dl_dmean * dmean_dx;
-      dx[idx] = static_cast<T>(dl_dx);
+      dx[idx] =   static_cast<T>(dl_dx);
     }
   }
 
