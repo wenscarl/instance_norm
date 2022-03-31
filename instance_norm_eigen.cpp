@@ -50,8 +50,8 @@ void InstanceNormEigen(const Eigen::Tensor<T, 3, Eigen::RowMajor>& in,
   Eigen::DSizes<Eigen::Index, 3> one_by_C_by_1(1, C, 1);
   Eigen::array<int, 3> bcast_D({1, 1, D});
   Eigen::array<int, 3> bcast_ND({N, 1, D});
-  Eigen::Tensor<float, 1, Eigen::RowMajor> mean(N);
-  Eigen::Tensor<float, 1, Eigen::RowMajor> variance(N);
+  Eigen::Tensor<float, 2, Eigen::RowMajor> mean(N, C);
+  Eigen::Tensor<float, 2, Eigen::RowMajor> variance(N, C);
 
   float D_inv = 1.0f / D;
   auto x = in.template cast<U>();
