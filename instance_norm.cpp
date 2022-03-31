@@ -70,7 +70,7 @@ void InstanceNormCPU(const T* x, const U* gamma, const U* beta, const int N, con
 template <typename T, typename U>
 void InstanceNormGradCPU(const T* dy, const T* x, const U* gamma, const int N, const int C,
                       const int D, const U epsilon, U* dgamma, U* dbeta,
-                      T* dx, const int is_channel_first) {
+                      T* dx, U* dl_dvars, U* dl_dmus, const int is_channel_first) {
   LayOut layout = is_channel_first ? channel_first : channel_last;
   int NxC = N * C;
   int CxD = C * D;
@@ -155,6 +155,7 @@ void InstanceNormGradCPU(const T* dy, const T* x, const U* gamma, const int N, c
     for (int j = 0; j < D; j++) {
       int idx = (layout == channel_last) ? in * C*D+j*C+ic : i*D+j;
       U curr = static_cast<U>(dy[idx]);
+      
       U dl_di = curr * gamma[ic] * cache_ivar[i];
       U di_dx = 1.;
 
@@ -165,8 +166,11 @@ void InstanceNormGradCPU(const T* dy, const T* x, const U* gamma, const int N, c
       U dmean_dx = 1. / D;
 
       U dl_dx = dl_di * di_dx + dl_dvar * dvar_dx + dl_dmean * dmean_dx;
+      // U dl_dx = dl_di * di_dx;
       dx[idx] =   static_cast<T>(dl_dx);
     }
+    dl_dvars[i] = dl_dvar;
+    dl_dmus[i] = dl_dmean;
   }
 
   delete[] cache_mean;
@@ -213,8 +217,10 @@ void instance_norm(const float* x, const float* gamma, const float* beta,
 
 void instance_norm_grad(const float* dy, const float* x, const float* gamma,
                      const int N, const int C, const int D, const float epsilon, float* dx,
-                     float* dgamma, float* dbeta, const int is_channel_first) {
-  InstanceNormGradCPU(dy, x, gamma, N, C, D, epsilon, dgamma, dbeta, dx, is_channel_first);
+                     float* dgamma, float* dbeta, float* dl_dvars, float* dl_dmus,
+                     const int is_channel_first) {
+  InstanceNormGradCPU(dy, x, gamma, N, C, D, epsilon, dgamma, dbeta, dx, dl_dvars, 
+                      dl_dmus, is_channel_first);
 }
 
 void is_close_2d_host(const float* x, const float* y, int N, int C, int D,
@@ -226,6 +232,7 @@ void print_2d(const float* x, int N, int C, int D, std::string msg) {
   Print2DHost(x, N, C, D, msg);
 }
 }
+
 
 
 
