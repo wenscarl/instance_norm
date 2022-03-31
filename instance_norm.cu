@@ -36,8 +36,7 @@ void InstanceNormCPU(const T *x, const U *gamma, const U *beta, const int N,
 template <typename T, typename U>
 void InstanceNormGradCPU(const T *dy, const T *x, const U *gamma, const int N,
                          const int C, const int D, const U epsilon, U *dgamma,
-                         U *dbeta, T *dx, U *dl_dvars, U *dl_dmus,
-                         const int is_channel_first);
+                         U *dbeta, T *dx, const int is_channel_first);
 
 template <typename T, typename U>
 void InstanceNormCPUHelper(const T *x, const U *gamma, const U *beta,
@@ -70,8 +69,7 @@ template <typename T, typename U>
 void InstanceNormGradCPUHelper(const T *dy, const T *x, const U *gamma,
                                const int N, const int C, const int D,
                                const U epsilon, U *dgamma_h, U *dbeta_h,
-                               T *dx_h, U *dl_dvars_h, U *dl_dmus_h,
-                               const int is_channel_first)
+                               T *dx_h, const int is_channel_first)
 {
   T *dy_h = new T[N * C * D];
   T *x_h = new T[N * C * D];
@@ -85,7 +83,7 @@ void InstanceNormGradCPUHelper(const T *dy, const T *x, const U *gamma,
   double time_spent = 0.0;
   clock_t begin = clock();
   InstanceNormGradCPU(dy_h, x_h, gamma_h, N, C, D, epsilon, dgamma_h, dbeta_h,
-                      dx_h, dl_dvars_h, dl_dmus_h, is_channel_first);
+                      dx_h, is_channel_first);
   clock_t end = clock();
   time_spent += (double)(end - begin) / (CLOCKS_PER_SEC / 1000);
   printf("InstanceNormGradCPU time: %f ms\n", time_spent);
@@ -322,9 +320,9 @@ struct DxOp
       int row = idx / D;
       U dl_di = curr * gamma[row % C] * cache_ivar[row];
       U di_dx = 1.;
-      U dvar_dx = 2. * (x[idx] - cache_mean[row]) / D;
-      U dmu_dx = 1. / D;
-      dl_dx = dl_di * di_dx + dl_dvars[row] * dvar_dx + dl_dmus[row] * dmu_dx;
+      U dvar_dx = 2. * (x[idx] - cache_mean[row]);
+      U dmu_dx = 1.;
+      dl_dx = 1. / D * (dl_dvars[row] * dvar_dx + dl_dmus[row] * dmu_dx) + dl_di * di_dx ;
     }
     else
     { // NDC
@@ -332,10 +330,10 @@ struct DxOp
       int cache_idx = idx / (C * D) * C + idx % C;
       U dl_di = curr * gamma[col] * cache_ivar[cache_idx];
       U di_dx = 1.;
-      U dvar_dx = 2. * (x[idx] - cache_mean[cache_idx]) / D;
-      U dmu_dx = 1. / D;
-      dl_dx = dl_di * di_dx  + dl_dvars[cache_idx] * dvar_dx + dl_dmus[cache_idx] * dmu_dx;
-      // dl_dx = dl_di * di_dx ;
+      U dvar_dx = 2. * (x[idx] - cache_mean[cache_idx]);
+      U dmu_dx = 1. ;
+      dl_dx = 1. / D * (dl_dvars[cache_idx] * dvar_dx +
+              dl_dmus[cache_idx] * dmu_dx )  + dl_di * di_dx;
     }
     return static_cast<T>(dl_dx);
   }
@@ -372,11 +370,36 @@ struct YOp
   }
 };
 
+template <typename U, typename Op>
+__global__ void InstanceNormRowReduceTempToOut(const U *__restrict__ temp,
+                                               const int N, const int C,
+                                               const int cols,
+                                               U *__restrict__ cache, Op op)
+{
+  typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
+  __shared__ typename BlockReduce::TempStorage temp_storage;
+  for (int k = blockIdx.x; k < N * C; k += gridDim.x)
+  {
+    U partial_sum = 0;
+    for (int i = threadIdx.x; i < cols; i += kBlockSize)
+    {
+      partial_sum += temp[k * cols + i];
+    }
+
+    U sum = BlockReduce(temp_storage).Sum(partial_sum);
+
+    if (threadIdx.x == 0)
+    {
+      cache[k] = op.Finalize(sum);
+    }
+  }
+}
+
 template <typename T, typename U, typename Op>
-__global__ void InstanceNormRowReduceInToOut_NDC(const T *__restrict__ in,
-                                                 const int N, const int C,
-                                                 const int D,
-                                                 U *__restrict__ temp, Op op)
+__global__ void InstanceNormRowReduceInToTemp_NDC(const T *__restrict__ in,
+                                                  const int N, const int C,
+                                                  const int D,
+                                                  U *__restrict__ temp, Op op)
 {
   // blocks(C / 32, 1, N);
   // threads(32, kBlocksize/32,1)
@@ -409,6 +432,91 @@ __global__ void InstanceNormUpdate(const T *__restrict__ in, const int N,
   }
 }
 
+template <typename T, typename U, typename Op1, typename Op2>
+void InstanceNormReductionsChannelFirst(
+    int N, int C, int D, T *x, U *temp_1, U *temp_2,
+    Op1 op1, Op2 op2)
+{
+
+  int NxC = N * C;
+  const int min_num_blocks = kWarpSize;
+  const int min_workload_per_thread = 100;
+  bool use_single_block =
+      (D <= min_num_blocks * kBlockSize * min_workload_per_thread);
+  if (use_single_block)
+  {
+    InstanceNormRowReduceInToOut<<<N, kBlockSize>>>(
+        x, NxC, D, temp_1, temp_2, op1, op2);
+  }
+  else
+  {
+    printf("XLOG, InstanceNormReductionsChannelFirst: Mean/Var -> multi-block per row\n");
+    const int blocks_per_row = DivUp(D, kBlockSize * min_workload_per_thread);
+
+    float *temp_buffer_1;
+    float *temp_buffer_2;
+    dim3 threads, blocks;
+    int temp_total_rows;
+
+    PrepareAlloc(&temp_buffer_1, N * C * blocks_per_row);
+    PrepareAlloc(&temp_buffer_2, N * C * blocks_per_row);
+    threads.x = kBlockSize;
+    blocks.x = blocks_per_row;
+    blocks.y = N;
+    temp_total_rows = blocks_per_row;
+    printf("XLOG: num_blocks per row=%d\n", blocks.x);
+    // For long rows, we launch n blocks to process each row. The intermediate
+    // results are stored in a temp memory with the size of N*n. Then, we
+    // launch single block to handle each row of the temp memory.
+    InstanceNormRowReduceInToTemp<<<blocks, threads>>>(
+        x, N, C, D, temp_buffer_1, op1);
+    InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
+        temp_buffer_1, N, C, temp_total_rows, temp_1, op1);
+
+    InstanceNormRowReduceInToTemp<<<blocks, threads>>>(
+        x, N, C, D, temp_buffer_2, op2);
+    InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
+        temp_buffer_2, N, C, temp_total_rows, temp_2, op2);
+
+    checkCUDA(cudaFree(temp_buffer_1));
+    checkCUDA(cudaFree(temp_buffer_2));
+  }
+}
+
+template <typename T, typename U, typename Op1, typename Op2>
+void InstanceNormReductionsChannelLast(
+    int N, int C, int D, T *x, U *temp_1, U *temp_2,
+    Op1 op1, Op2 op2)
+{
+  dim3 threads(kWarpSize, kBlockSize / kWarpSize);
+  const int local_min_workload_per_thread = 3200;
+  int ppr = DivUp(D, threads.y * local_min_workload_per_thread); //~ 10
+
+  float *temp_buffer_1;
+  float *temp_buffer_2;
+  dim3 blocks(DivUp(C, kWarpSize), ppr, N);
+  printf("XLOG: InstanceNormReductionsChannelLast!\n");
+  printf("XLOG: in NDC, num_blocks per row=%d\n", ppr);
+  printf("XLOG: thread.XYZ=%d, %d, %d\n", threads.x, threads.y, threads.z);
+  printf("XLOG: blocks.XYZ=%d, %d, %d\n", blocks.x, blocks.y, blocks.z);
+
+  PrepareAlloc(&temp_buffer_1, N * C * threads.y * ppr);
+  PrepareAlloc(&temp_buffer_2, N * C * threads.y * ppr);
+  int is_channel_first = 0;
+  InstanceNormRowReduceInToTemp<<<blocks, threads>>>(x, N, C, D,
+                                                     temp_buffer_1, op1, is_channel_first);
+  InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
+      temp_buffer_1, N, C, threads.y * ppr, temp_1, op1);
+
+  InstanceNormRowReduceInToTemp<<<blocks, threads>>>(
+      x, N, C, D, temp_buffer_2, op2, is_channel_first);
+  InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
+      temp_buffer_2, N, C, threads.y * ppr, temp_2, op2);
+
+  checkCUDA(cudaFree(temp_buffer_1));
+  checkCUDA(cudaFree(temp_buffer_2));
+}
+
 template <typename T, typename U>
 void InstanceNormGPU(const T *x, const U *gamma, const U *beta, const U epsilon,
                      const int N, const int C, const int D, T *y, U *cache_mean,
@@ -432,7 +540,8 @@ void InstanceNormGPU(const T *x, const U *gamma, const U *beta, const U epsilon,
 
   cudaEventRecord(start);
   int NxC = N * C;
-  if (use_single_warp)
+
+  if (use_single_warp) // this is trivial case
   {
     printf("XLOG: Mean/Var -> single-warp per row\n");
     printf("Run CUDA with %d blocks and each %d threads!\n",
@@ -442,106 +551,127 @@ void InstanceNormGPU(const T *x, const U *gamma, const U *beta, const U epsilon,
         x, N, C, D, cache_mean, cache_ivar, mean_ops, ivar_ops,
         is_channel_first);
   }
-  else if (use_single_block)
-  {
-    printf("XLOG: Mean/Var -> single-block per row\n");
-    if (is_channel_first)
-    {
-      InstanceNormRowReduceInToOut<<<N, kBlockSize>>>(
-          x, N, C, D, cache_mean, cache_ivar, mean_ops, ivar_ops,
-          is_channel_first);
-    }
-    else
-    {
-
-      // blocks(C / 32, N, 1);
-      // threads(32,1, 128/32)
-      float *temp_sum, *temp_ivar;
-      dim3 threads(kWarpSize, kBlockSize / kWarpSize);
-      const int local_min_workload_per_thread = 3200;
-      int ppr = DivUp(D, threads.y * local_min_workload_per_thread); //~ 10
-
-      dim3 blocks(DivUp(C, kWarpSize), ppr, N);
-
-      printf("XLOG: in NDC, num_blocks per row=%d\n", ppr);
-      printf("XLOG: thread.XYZ=%d, %d, %d\n", threads.x, threads.y, threads.z);
-      printf("XLOG: blocks.XYZ=%d, %d, %d\n", blocks.x, blocks.y, blocks.z);
-      PrepareAlloc(&temp_sum, N * C * threads.y * ppr);
-      PrepareAlloc(&temp_ivar, N * C * threads.y * ppr);
-      InstanceNormRowReduceInToOut_NDC<<<blocks, threads>>>(x, N, C, D,
-                                                            temp_sum, mean_ops);
-      InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
-          temp_sum, N, C, threads.y * ppr, cache_mean, mean_ops);
-
-      InstanceNormRowReduceInToOut_NDC<<<blocks, threads>>>(
-          x, N, C, D, temp_ivar, ivar_ops);
-      InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
-          temp_ivar, N, C, threads.y * ppr, cache_ivar, ivar_ops);
-
-      checkCUDA(cudaFree(temp_sum));
-      checkCUDA(cudaFree(temp_ivar));
-    }
-  }
   else
   {
-    printf("XLOG: Mean/Var -> multi-block per row\n");
-    const int blocks_per_row = DivUp(D, kBlockSize * min_workload_per_thread);
-
-    float *temp_sum;
-    float *temp_ivar;
-    dim3 threads, blocks;
-    int temp_total_rows;
-    printf("XLOG: I am %d !\b", is_channel_first);
     if (is_channel_first)
     {
-      PrepareAlloc(&temp_sum, N * C * blocks_per_row);
-      PrepareAlloc(&temp_ivar, N * C * blocks_per_row);
-      threads.x = kBlockSize;
-      blocks.x = blocks_per_row;
-      blocks.y = N;
-      temp_total_rows = blocks_per_row;
-      printf("XLOG: num_blocks per row=%d\n", blocks.x);
-      // For long rows, we launch n blocks to process each row. The intermediate
-      // results are stored in a temp memory with the size of N*n. Then, we
-      // launch single block to handle each row of the temp memory.
+      InstanceNormReductionsChannelFirst(
+          N, C, D, x, cache_mean, cache_ivar, mean_ops, ivar_ops);
     }
     else
     {
-      int thd_x = min(N * C, kBlockSize);
-      int thd_y = kBlockSize / thd_x;
-      int min_workload_per_thread = 10000;
-      const int blocks_per_row = DivUp(D, thd_y * min_workload_per_thread);
-
-      threads.x = thd_x;
-      threads.y = thd_y;
-      blocks.x = DivUp(N * C, thd_x);
-      blocks.y = blocks_per_row;
-      temp_total_rows = blocks_per_row * thd_y;
-      PrepareAlloc(&temp_sum, N * C * blocks_per_row * thd_y);
-      PrepareAlloc(&temp_ivar, N * C * blocks_per_row * thd_y);
-
-      printf("XLOG: Mean/Var -> multi-block per row\n");
-      printf("XLOG: in NDC, num_blocks per row=%d\n", blocks_per_row);
-      printf("XLOG: thread.XYZ=%d, %d, %d\n", threads.x, threads.y, threads.z);
-      printf("XLOG: blocks.XYZ=%d, %d, %d\n", blocks.x, blocks.y, blocks.z);
-
-      // For long rows, we launch n blocks to process each row. The intermediate
-      // results are stored in a temp memory with the size of N*n. Then, we
-      // launch single block to handle each row of the temp memory.
+      InstanceNormReductionsChannelLast(
+          N, C, D, x, cache_mean, cache_ivar, mean_ops, ivar_ops);
     }
-    InstanceNormRowReduceInToTemp<<<blocks, threads>>>(
-        x, N, C, D, temp_sum, mean_ops, is_channel_first);
-    InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
-        temp_sum, N, C, temp_total_rows, cache_mean, mean_ops);
-
-    InstanceNormRowReduceInToTemp<<<blocks, threads>>>(
-        x, N, C, D, temp_ivar, ivar_ops, is_channel_first);
-    InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
-        temp_ivar, N, C, temp_total_rows, cache_ivar, ivar_ops);
-
-    checkCUDA(cudaFree(temp_ivar));
-    checkCUDA(cudaFree(temp_sum));
   }
+
+  // ###############################################
+  // if (use_single_warp)
+  // {
+  //   printf("XLOG: Mean/Var -> single-warp per row\n");
+  //   printf("Run CUDA with %d blocks and each %d threads!\n",
+  //          DivUp(NxC, kBlockSize / kWarpSize), kBlockSize);
+  //   InstanceNormRowReduceInToOutWarp<<<DivUp(NxC, kBlockSize / kWarpSize),
+  //                                      kBlockSize>>>(
+  //       x, N, C, D, cache_mean, cache_ivar, mean_ops, ivar_ops,
+  //       is_channel_first);
+  // }
+  // else if (true || use_single_block)
+  // {
+  //   printf("XLOG: Mean/Var -> single-block per row\n");
+  //   if (is_channel_first)
+  //   {
+  //     InstanceNormRowReduceInToOut<<<N, kBlockSize>>>(
+  //         x, N * C, D, cache_mean, cache_ivar, mean_ops, ivar_ops);
+  //   }
+  //   else
+  //   {
+  //     float *temp_sum, *temp_ivar;
+  //     dim3 threads(kWarpSize, kBlockSize / kWarpSize);
+  //     const int local_min_workload_per_thread = 3200;
+  //     int ppr = DivUp(D, threads.y * local_min_workload_per_thread); //~ 10
+
+  //     dim3 blocks(DivUp(C, kWarpSize), ppr, N);
+
+  //     printf("XLOG: in NDC, num_blocks per row=%d\n", ppr);
+  //     printf("XLOG: thread.XYZ=%d, %d, %d\n", threads.x, threads.y, threads.z);
+  //     printf("XLOG: blocks.XYZ=%d, %d, %d\n", blocks.x, blocks.y, blocks.z);
+  //     PrepareAlloc(&temp_sum, N * C * threads.y * ppr);
+  //     PrepareAlloc(&temp_ivar, N * C * threads.y * ppr);
+  //     InstanceNormRowReduceInToTemp_NDC<<<blocks, threads>>>(x, N, C, D,
+  //                                                            temp_sum, mean_ops);
+  //     InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
+  //         temp_sum, N, C, threads.y * ppr, cache_mean, mean_ops);
+
+  //     InstanceNormRowReduceInToTemp_NDC<<<blocks, threads>>>(
+  //         x, N, C, D, temp_ivar, ivar_ops);
+  //     InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
+  //         temp_ivar, N, C, threads.y * ppr, cache_ivar, ivar_ops);
+
+  //     checkCUDA(cudaFree(temp_sum));
+  //     checkCUDA(cudaFree(temp_ivar));
+  //   }
+  // }
+  // else
+  // {
+  //   printf("XLOG: Mean/Var -> multi-block per row\n");
+  //   const int blocks_per_row = DivUp(D, kBlockSize * min_workload_per_thread);
+
+  //   float *temp_sum;
+  //   float *temp_ivar;
+  //   dim3 threads, blocks;
+  //   int temp_total_rows;
+  //   printf("XLOG: I am %d !\b", is_channel_first);
+  //   if (is_channel_first)
+  //   {
+  //     PrepareAlloc(&temp_sum, N * C * blocks_per_row);
+  //     PrepareAlloc(&temp_ivar, N * C * blocks_per_row);
+  //     threads.x = kBlockSize;
+  //     blocks.x = blocks_per_row;
+  //     blocks.y = N;
+  //     temp_total_rows = blocks_per_row;
+  //     printf("XLOG: num_blocks per row=%d\n", blocks.x);
+  //     // For long rows, we launch n blocks to process each row. The intermediate
+  //     // results are stored in a temp memory with the size of N*n. Then, we
+  //     // launch single block to handle each row of the temp memory.
+  //   }
+  //   else
+  //   {
+  //     int thd_x = min(N * C, kBlockSize);
+  //     int thd_y = kBlockSize / thd_x;
+  //     int min_workload_per_thread = 10000;
+  //     const int blocks_per_row = DivUp(D, thd_y * min_workload_per_thread);
+
+  //     threads.x = thd_x;
+  //     threads.y = thd_y;
+  //     blocks.x = DivUp(N * C, thd_x);
+  //     blocks.y = blocks_per_row;
+  //     temp_total_rows = blocks_per_row * thd_y;
+  //     PrepareAlloc(&temp_sum, N * C * blocks_per_row * thd_y);
+  //     PrepareAlloc(&temp_ivar, N * C * blocks_per_row * thd_y);
+
+  //     printf("XLOG: Mean/Var -> multi-block per row\n");
+  //     printf("XLOG: in NDC, num_blocks per row=%d\n", blocks_per_row);
+  //     printf("XLOG: thread.XYZ=%d, %d, %d\n", threads.x, threads.y, threads.z);
+  //     printf("XLOG: blocks.XYZ=%d, %d, %d\n", blocks.x, blocks.y, blocks.z);
+
+  //     // For long rows, we launch n blocks to process each row. The intermediate
+  //     // results are stored in a temp memory with the size of N*n. Then, we
+  //     // launch single block to handle each row of the temp memory.
+  //   }
+  //   InstanceNormRowReduceInToTemp<<<blocks, threads>>>(
+  //       x, N, C, D, temp_sum, mean_ops, is_channel_first);
+  //   InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
+  //       temp_sum, N, C, temp_total_rows, cache_mean, mean_ops);
+
+  //   InstanceNormRowReduceInToTemp<<<blocks, threads>>>(
+  //       x, N, C, D, temp_ivar, ivar_ops, is_channel_first);
+  //   InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
+  //       temp_ivar, N, C, temp_total_rows, cache_ivar, ivar_ops);
+
+  //   checkCUDA(cudaFree(temp_ivar));
+  //   checkCUDA(cudaFree(temp_sum));
+  // }
   cudaEventRecord(stop);
 
   cudaEventSynchronize(stop);
@@ -568,7 +698,7 @@ template <typename T, typename U, typename Op1, typename Op2>
 __global__ void InstanceNormRowReduceInToOut(const T *__restrict__ in,
                                              const int N, const int D, U *out1,
                                              U *out2, Op1 op1, Op2 op2)
-{
+{ // this is for channel first only
   const int tid = threadIdx.x;
 
   typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
@@ -791,10 +921,107 @@ InstanceNormGradBetaGamma(const T *__restrict__ dy, const T *__restrict__ x,
 }
 
 template <typename T, typename U>
+void InstanceNormDataGrad(const T *dy, const T *x, const U *cache_mean,
+                          const U *cache_ivar, const U *gamma, const int N,
+                          const int C, const int D, U *temp_1, U *temp_2,
+                          const int is_channel_first)
+{
+
+  bool use_single_warp = (D <= kWarpSize);
+
+  const int min_num_blocks = kWarpSize;
+  const int min_workload_per_thread = 50;
+  bool use_single_block =
+      (D <= min_num_blocks * kBlockSize * min_workload_per_thread);
+
+  DvarOp<U, T> dl_dvar_ops{gamma, x, cache_ivar, cache_mean, C, D};
+  DmeanOp<U, T> dl_dmu_ops{gamma, x, cache_ivar, cache_mean, temp_1, C, D};
+
+  int NxC = N * C;
+  if (use_single_warp)
+  {
+    printf("XLOG: Dvar/Dmean -> single-warp per row\n");
+    InstanceNormRowReduceInToOutWarp<<<DivUp(NxC, kBlockSize / kWarpSize),
+                                       kBlockSize>>>(
+        dy, N, C, D, temp_1, temp_2, dl_dvar_ops, dl_dmu_ops, is_channel_first);
+  }
+  else
+  {
+    is_channel_first ? InstanceNormReductionsChannelFirst(
+                           N, C, D, dy, temp_1, temp_2, dl_dvar_ops, dl_dmu_ops)
+                     : InstanceNormReductionsChannelLast(
+                           N, C, D, dy, temp_1, temp_2, dl_dvar_ops, dl_dmu_ops);
+  }
+}
+
+template <typename T, typename U>
+void InstanceNormWeightsGrad(const T *dy, const T *x, const U *cache_mean,
+                             const U *cache_ivar, const int N,
+                             const int C, const int D, U *dgamma, U *dbeta,
+                             const int is_channel_first)
+{
+  printf("InstanceNormWeightsGrad\n");
+  printf("XLOG: Dweight -> multi-block per column\n");
+
+  const int min_rows_per_block = 100;
+  const int min_cols_per_block = 32;
+
+  float *temp_dgamma;
+  float *temp_dbeta;
+  int total_tmp_rows;
+  dim3 blocks;
+  dim3 threads;
+  if (is_channel_first)
+  {
+    const int reduced_rows =
+        DivUp(N * D, min_rows_per_block * min_rows_per_block);
+    const int reduced_cols = DivUp(C, min_cols_per_block);
+    PrepareAlloc(&temp_dgamma, reduced_rows * C);
+    PrepareAlloc(&temp_dbeta, reduced_rows * C);
+    blocks.x = reduced_rows;
+    blocks.y = reduced_cols;
+    threads.x = kBlockSize;
+    printf("XLOG: NCD, reduced_rows, reduced_cols=%d,%d\n", reduced_rows,
+           reduced_cols);
+    printf("XLOG: NCD, blockDIM,XYZ=%d,%d,%d\n", blocks.x, blocks.y,
+           blocks.z);
+
+    total_tmp_rows = reduced_rows;
+  }
+  else
+  { // chanell last
+    int thd_x = min(C, kBlockSize);
+    int thd_y = kBlockSize / thd_x;
+    int min_workload_per_thread = 3200;
+    const int blocks_per_row = DivUp(N * D, thd_y * min_workload_per_thread);
+    threads.x = thd_x;
+    threads.y = thd_y;
+
+    blocks.x = DivUp(C, thd_x);
+    blocks.y = blocks_per_row;
+
+    PrepareAlloc(&temp_dgamma, C * blocks_per_row * thd_y);
+    PrepareAlloc(&temp_dbeta, C * blocks_per_row * thd_y);
+
+    printf("XLOG: NDC, reduced_rows:%d, blocks dimXYZ=%d,%d,%d\n",
+           blocks_per_row, blocks.x, blocks.y, blocks.z);
+    printf("XLOG: NDC, threads dimXYZ=%d,%d,%d\n", threads.x, threads.y,
+           threads.z);
+    total_tmp_rows = min(N * D, blocks_per_row * thd_y);
+  }
+  InstanceNormBetaGammaRowReduceInToTemp<<<blocks, threads>>>(
+      x, dy, cache_mean, cache_ivar, N, C, D, temp_dbeta, temp_dgamma,
+      is_channel_first);
+  InstanceNormGradBetaGammaTempToOut<<<DivUp(C, kBlockSize), kBlockSize>>>(
+      temp_dgamma, temp_dbeta, C, total_tmp_rows, dgamma, dbeta);
+  checkCUDA(cudaFree(temp_dgamma));
+  checkCUDA(cudaFree(temp_dbeta));
+}
+
+template <typename T, typename U>
 void InstanceNormGradGPU(const T *dy, const T *x, const U *cache_mean,
                          const U *cache_ivar, const U *gamma, const int N,
                          const int C, const int D, T *dx, U *dgamma, U *dbeta,
-                         const U *dl_dvars_ref, const U *dl_dmus_ref,
                          const int is_channel_first)
 {
   cudaEvent_t start, stop;
@@ -814,60 +1041,10 @@ void InstanceNormGradGPU(const T *dy, const T *x, const U *cache_mean,
   //   InstanceNormGradBetaGamma<<<DivUp(C, kBlockSize), kBlockSize>>>(
   //       dy, x, cache_mean, cache_ivar, N, C, D, dgamma, dbeta, is_channel_first);
   // } else
-  {
-    printf("XLOG: Dweight -> multi-block per column\n");
 
-    float *temp_dgamma;
-    float *temp_dbeta;
-    int total_tmp_rows;
-    dim3 blocks;
-    dim3 threads;
-    if (is_channel_first)
-    {
-      const int reduced_rows =
-          DivUp(N * D, min_rows_per_block * min_rows_per_block);
-      const int reduced_cols = DivUp(C, min_cols_per_block);
-      PrepareAlloc(&temp_dgamma, reduced_rows * C);
-      PrepareAlloc(&temp_dbeta, reduced_rows * C);
-      blocks.x = reduced_rows;
-      blocks.y = reduced_cols;
-      threads.x = kBlockSize;
-      printf("XLOG: NCD, reduced_rows, reduced_cols=%d,%d\n", reduced_rows,
-             reduced_cols);
-      printf("XLOG: NCD, blockDIM,XYZ=%d,%d,%d\n", blocks.x, blocks.y,
-             blocks.z);
+  InstanceNormWeightsGrad(dy, x, cache_mean, cache_ivar, N, C, D, dgamma, dbeta,
+                          is_channel_first);
 
-      total_tmp_rows = reduced_rows;
-    }
-    else
-    { // chanell last
-      int thd_x = min(C, kBlockSize);
-      int thd_y = kBlockSize / thd_x;
-      int min_workload_per_thread = 3200;
-      const int blocks_per_row = DivUp(N * D, thd_y * min_workload_per_thread);
-      threads.x = thd_x;
-      threads.y = thd_y;
-
-      blocks.x = DivUp(C, thd_x);
-      blocks.y = blocks_per_row;
-
-      PrepareAlloc(&temp_dgamma, C * blocks_per_row * thd_y);
-      PrepareAlloc(&temp_dbeta, C * blocks_per_row * thd_y);
-
-      printf("XLOG: NDC, reduced_rows:%d, blocks dimXYZ=%d,%d,%d\n",
-             blocks_per_row, blocks.x, blocks.y, blocks.z);
-      printf("XLOG: NDC, threads dimXYZ=%d,%d,%d\n", threads.x, threads.y,
-             threads.z);
-      total_tmp_rows = min(N * D, blocks_per_row * thd_y);
-    }
-    InstanceNormBetaGammaRowReduceInToTemp<<<blocks, threads>>>(
-        x, dy, cache_mean, cache_ivar, N, C, D, temp_dbeta, temp_dgamma,
-        is_channel_first);
-    InstanceNormGradBetaGammaTempToOut<<<DivUp(C, kBlockSize), kBlockSize>>>(
-        temp_dgamma, temp_dbeta, C, total_tmp_rows, dgamma, dbeta);
-    checkCUDA(cudaFree(temp_dgamma));
-    checkCUDA(cudaFree(temp_dbeta));
-  }
   cudaEventRecord(stop);
 
   cudaEventSynchronize(stop);
@@ -880,189 +1057,19 @@ void InstanceNormGradGPU(const T *dy, const T *x, const U *cache_mean,
   PrepareAlloc(&temp_1, NxC);
   PrepareAlloc(&temp_2, NxC);
 
-  bool use_single_warp = (D <= kWarpSize);
-
-  const int min_num_blocks = kWarpSize;
-  const int min_workload_per_thread = 50;
-  bool use_single_block =
-      (D <= min_num_blocks * kBlockSize * min_workload_per_thread);
-
-  DvarOp<U, T> dl_dvar_ops{gamma, x, cache_ivar, cache_mean, C, D};
-  DmeanOp<U, T> dl_dmu_ops{gamma, x, cache_ivar, cache_mean, temp_1, C, D};
-
   cudaEventRecord(start);
-  if (use_single_warp)
-  {
-    printf("XLOG: Dvar/Dmean -> single-warp per row\n");
-    InstanceNormRowReduceInToOutWarp<<<DivUp(NxC, kBlockSize / kWarpSize),
-                                       kBlockSize>>>(
-        dy, N, C, D, temp_1, temp_2, dl_dvar_ops, dl_dmu_ops, is_channel_first);
-  }
-  else if (use_single_block)
-  {
-    printf("XLOG: Dvar/Dmean -> single-block per row\n");
-    if (is_channel_first)
-    {
-      printf("Run NCD CUDA with %d blocks and each %d threads!\n", NxC,
-             kBlockSize);
-      InstanceNormRowReduceInToOut<<<NxC, kBlockSize>>>(
-          dy, NxC, D, temp_1, temp_2, dl_dvar_ops, dl_dmu_ops);
-    }
-    else
-    {
-      // blocks(C / 32, N, 1);
-      // threads(32,1, 128/32)
-      float *temp_dl_dvars;
-      float *temp_dl_dmus;
-      dim3 threads(kWarpSize, kBlockSize / kWarpSize);
-      const int min_workload_per_thread = 3200;
-      int ppr = DivUp(D, threads.y * min_workload_per_thread); //~ 10
-
-      dim3 blocks(DivUp(C, kWarpSize), ppr, N);
-
-      printf("XLOG: in NDC, num_blocks per row=%d\n", ppr);
-      printf("XLOG: thread.XYZ=%d, %d, %d\n", threads.x, threads.y, threads.z);
-      printf("XLOG: blocks.XYZ=%d, %d, %d\n", blocks.x, blocks.y, blocks.z);
-      PrepareAlloc(&temp_dl_dvars, N * C * threads.y * ppr);
-      PrepareAlloc(&temp_dl_dmus, N * C * threads.y * ppr);
-      InstanceNormRowReduceInToOut_NDC<<<blocks, threads>>>(
-          dy, N, C, D, temp_dl_dvars, dl_dvar_ops);
-      InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
-          temp_dl_dvars, N, C, threads.y * ppr, temp_1, dl_dvar_ops);
-
-      InstanceNormRowReduceInToOut_NDC<<<blocks, threads>>>(
-          dy, N, C, D, temp_dl_dmus, dl_dmu_ops);
-      InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
-          temp_dl_dmus, N, C, threads.y * ppr, temp_2, dl_dmu_ops);
-
-      checkCUDA(cudaFree(temp_dl_dvars));
-      checkCUDA(cudaFree(temp_dl_dmus));
-    }
-  }
-  else
-  {
-    float *temp_dl_dvars;
-    float *temp_dl_dmus;
-    dim3 blocks, threads;
-    int temp_total_rows;
-    if (is_channel_first)
-    {
-      const int blocks_per_row = DivUp(D, kBlockSize * min_workload_per_thread);
-      PrepareAlloc(&temp_dl_dvars, NxC * blocks_per_row);
-      PrepareAlloc(&temp_dl_dmus, NxC * blocks_per_row);
-
-      threads.x = kBlockSize;
-      blocks.x = blocks_per_row;
-      blocks.y = N;
-      temp_total_rows = blocks_per_row;
-      printf("XLOG: num_blocks per row=%d\n", blocks.x);
-      // printf("Run CUDA with %d blocks and each %d threads!\n", NxC,
-      // kBlockSize);
-    }
-    else
-    { // channel last
-      int thd_x = min(N * C, kBlockSize);
-      int thd_y = kBlockSize / thd_x;
-      int min_workload_per_thread = 1000;
-      const int blocks_per_row = DivUp(D, thd_y * min_workload_per_thread);
-
-      threads.x = thd_x;
-      threads.y = thd_y;
-      blocks.x = DivUp(N * C, thd_x);
-      blocks.y = blocks_per_row;
-      temp_total_rows = blocks_per_row * thd_y;
-      PrepareAlloc(&temp_dl_dvars, N * C * blocks_per_row * thd_y);
-      PrepareAlloc(&temp_dl_dmus, N * C * blocks_per_row * thd_y);
-
-      printf("XLOG: Dmean/Dvar -> multi-block per row\n");
-      printf("XLOG: in NDC, num_blocks per row=%d\n", blocks_per_row);
-      printf("XLOG: thread.XYZ=%d, %d, %d\n", threads.x, threads.y, threads.z);
-      printf("XLOG: blocks.XYZ=%d, %d, %d\n", blocks.x, blocks.y, blocks.z);
-    }
-    InstanceNormRowReduceInToTemp<<<blocks, threads>>>(
-        dy, N, C, D, temp_dl_dvars, dl_dvar_ops, is_channel_first);
-    InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
-        temp_dl_dvars, N, C, temp_total_rows, temp_1, dl_dvar_ops);
-    InstanceNormRowReduceInToTemp<<<blocks, threads>>>(
-        dy, N, C, D, temp_dl_dmus, dl_dmu_ops, is_channel_first);
-    InstanceNormRowReduceTempToOut<<<N * C, kBlockSize>>>(
-        temp_dl_dmus, N, C, temp_total_rows, temp_2, dl_dmu_ops);
-
-    checkCUDA(cudaFree(temp_dl_dvars));
-    checkCUDA(cudaFree(temp_dl_dmus));
-
-    // // const int blocks_per_row = DivUp(D, kBlockSize *
-    // min_workload_per_thread);
-
-    // // float *temp_dl_dvars;
-    // // float *temp_dl_dmus;
-    // // PrepareAlloc(&temp_dl_dvars, NxC * blocks_per_row);
-    // // PrepareAlloc(&temp_dl_dmus, NxC * blocks_per_row);
-
-    // // dim3 threads(kBlockSize, 1, 1);
-    // // dim3 blocks(blocks_per_row, N, 1);
-    // // printf("XLOG: num_blocks per row=%d\n", blocks.x);
-    // // // printf("Run CUDA with %d blocks and each %d threads!\n", NxC,
-    // // // kBlockSize);
-    // // InstanceNormRowReduceInToTemp<<<blocks, threads>>>(
-    // //     dy, N, C, D, temp_dl_dvars, dl_dvar_ops);
-    // // InstanceNormRowReduceTempToOut<<<NxC, threads>>>(
-    // //     temp_dl_dvars, N, C, blocks_per_row, temp_1, dl_dvar_ops);
-
-    // // InstanceNormRowReduceInToTemp<<<blocks, threads>>>(
-    // //     dy, N, C, D, temp_dl_dmus, dl_dmu_ops);
-    // // InstanceNormRowReduceTempToOut<<<NxC, threads>>>(
-    // //     temp_dl_dmus, N, C, blocks_per_row, temp_2, dl_dmu_ops);
-
-    // checkCUDA(cudaFree(temp_dl_dvars));
-    // checkCUDA(cudaFree(temp_dl_dmus));
-
-    // printf("XLOG: Dvar/Dmean -> multi-block per row\n");
-    // const int blocks_per_row = DivUp(D, kBlockSize *
-    // min_workload_per_thread);
-
-    // float* temp_dl_dvars;
-    // float* temp_dl_dmus;
-    // PrepareAlloc(&temp_dl_dvars, N * blocks_per_row);
-    // PrepareAlloc(&temp_dl_dmus, N * blocks_per_row);
-
-    // dim3 threads(kBlockSize, 1, 1);
-    // dim3 blocks(blocks_per_row, N, 1);
-    // printf("XLOG: num_blocks per row=%d\n", blocks.x);
-
-    // InstanceNormRowReduceInToTemp<<<blocks, threads>>>(dy, N, C, D,
-    // temp_dl_dvars,
-    //                                                 dl_dvar_ops);
-    // InstanceNormRowReduceTempToOut<<<N, threads>>>(
-    //     temp_dl_dvars, N, C, blocks_per_row, temp_1, dl_dvar_ops);
-
-    // InstanceNormRowReduceInToTemp<<<blocks, threads>>>(dy, N,C, D,
-    // temp_dl_dmus,
-    //                                                 dl_dmu_ops);
-    // InstanceNormRowReduceTempToOut<<<N, threads>>>(temp_dl_dmus, N, C,
-    // blocks_per_row,
-    //                                             temp_2, dl_dmu_ops);
-
-    // checkCUDA(cudaFree(temp_dl_dvars));
-    // checkCUDA(cudaFree(temp_dl_dmus));
-  }
+  InstanceNormDataGrad(dy, x, cache_mean, cache_ivar, gamma, N, C, D, temp_1, temp_2,
+                       is_channel_first);
   cudaEventRecord(stop);
 
   cudaEventSynchronize(stop);
   float milliseconds_reduce = 0;
   cudaEventElapsedTime(&milliseconds_reduce, start, stop);
 
+  // Print2D(temp_1, N, C, 1, "GPU dl_dvars:");
+  // Print2D(temp_2, N, C, 1, "GPU dl_dmus:");
   cudaEventRecord(start);
   DxOp<T, U> dx_ops{x, cache_mean, cache_ivar, gamma, temp_1, temp_2, C, D};
-  // DxOp<T, U> dx_ops{x, cache_mean, cache_ivar, gamma, dl_dvars_ref, dl_dmus_ref, C, D};
-////////////////////////////######################
-  Print2D(temp_1, N, C, 1, "GPU dl_dvars:");
-  Print2D(dl_dvars_ref, N, C, 1, "CPU dl_dvars:");
-    Print2D(temp_2, N, C, 1, "GPU dl_dmus:");
-  Print2D(dl_dmus_ref, N, C, 1, "CPU dl_dmus:");
-
-///////////////////////////#######################
-
   int min_work_per_thread = 100;
 
   InstanceNormUpdate<<<DivUp(NxC * D, kBlockSize * min_work_per_thread),
@@ -1144,60 +1151,11 @@ InstanceNormRowReduceInToOutWarp(const T *__restrict__ in, const int N,
   }
 }
 
-template <typename T, typename U, typename Op1, typename Op2>
-__global__ void
-InstanceNormRowReduceInToOut(const T *__restrict__ in, const int N, const int C,
-                             const int D, U *out1, U *out2, Op1 op1, Op2 op2,
-                             const bool is_channel_first = true)
-{
-
-  const int tid = threadIdx.x;
-
-  typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
-  __shared__ union
-  {
-    typename BlockReduce::TempStorage reduce;
-    U broadcast[1];
-  } temp_storage;
-
-  for (int k = blockIdx.x; k < N * C; k += gridDim.x)
-  {
-    U partial_sum = 0;
-    for (int i = tid; i < D; i += kBlockSize)
-    {
-      partial_sum += op1.Compute(in, k, i);
-    }
-
-    U sum = BlockReduce(temp_storage.reduce).Sum(partial_sum);
-
-    if (tid == 0)
-    {
-      temp_storage.broadcast[0] = op1.Finalize(sum);
-      out1[k] = op1.Finalize(sum);
-    }
-    __syncthreads();
-    sum = temp_storage.broadcast[0];
-
-    partial_sum = 0;
-    for (int i = tid; i < D; i += kBlockSize)
-    {
-      partial_sum += op2.Compute(in, k, i, sum);
-    }
-
-    sum = BlockReduce(temp_storage.reduce).Sum(partial_sum);
-
-    if (tid == 0)
-    {
-      out2[k] = op2.Finalize(sum);
-    }
-  }
-}
-
 template <typename T, typename U, typename Op>
 __global__ void
 InstanceNormRowReduceInToTemp(const T *__restrict__ x, const int N, const int C,
                               const int D, U *__restrict__ temp, Op op,
-                              const int is_channel_first = true)
+                              const int is_channel_first = 1)
 {
   if (is_channel_first)
   {
@@ -1222,45 +1180,20 @@ InstanceNormRowReduceInToTemp(const T *__restrict__ x, const int N, const int C,
   }
   else
   {
-    const int col_offset = threadIdx.y + blockIdx.y * blockDim.y;
-    const int row_offset = threadIdx.x + blockIdx.x * blockDim.x;
-    if (row_offset >= N * C)
+    // blocks(C / 32, 1, N);
+    // threads(32, kBlocksize/32,1)
+    const int x_tid = threadIdx.x + blockIdx.x * blockDim.x;
+    const int y_tid = threadIdx.y + blockIdx.y * blockDim.y;
+    const int z_tid = threadIdx.z + blockIdx.z * blockDim.z;
+    if (x_tid >= C)
       return;
     U partial_sum = 0;
-    for (int y_idx = col_offset; y_idx < D; y_idx += blockDim.y * gridDim.y)
+    for (int i = y_tid; i < D; i += blockDim.y * gridDim.y)
     {
-      partial_sum += op.Compute_ndc(x, row_offset / C, y_idx, row_offset % C);
-    }
-    const int bpr = gridDim.y;
-    temp[row_offset * bpr * blockDim.y + col_offset] = partial_sum;
-    //      if (threadIdx.y == 0 && col_offset < D){
-    //        temp[row_offset *bpr+blockIdx.y] = partial_sum;
-    //      }
-  }
-}
-
-template <typename U, typename Op>
-__global__ void InstanceNormRowReduceTempToOut(const U *__restrict__ temp,
-                                               const int N, const int C,
-                                               const int cols,
-                                               U *__restrict__ cache, Op op)
-{
-  typedef cub::BlockReduce<U, kBlockSize> BlockReduce;
-  __shared__ typename BlockReduce::TempStorage temp_storage;
-  for (int k = blockIdx.x; k < N * C; k += gridDim.x)
-  {
-    U partial_sum = 0;
-    for (int i = threadIdx.x; i < cols; i += kBlockSize)
-    {
-      partial_sum += temp[k * cols + i];
+      partial_sum += op.Compute_ndc(x, z_tid, i, x_tid);
     }
 
-    U sum = BlockReduce(temp_storage).Sum(partial_sum);
-
-    if (threadIdx.x == 0)
-    {
-      cache[k] = op.Finalize(sum);
-    }
+    temp[(z_tid * C + x_tid) * blockDim.y * gridDim.y + y_tid] = partial_sum;
   }
 }
 
@@ -1295,13 +1228,9 @@ int main(int argc, char **argv)
   DTYPE *y;
   float *cache_ivar;
   float *cache_mean;
-  float *dl_dvars;
-  float *dl_dmus;
   PrepareAlloc(&y, N * C * D);
   PrepareAlloc(&cache_ivar, N * C);
   PrepareAlloc(&cache_mean, N * C);
-  PrepareAlloc(&dl_dvars, N * C);
-  PrepareAlloc(&dl_dmus, N * C);
 
   const float epsilon = 0.001f;
   InstanceNormGPU(x, gamma, beta, epsilon, N, C, D, y, cache_mean, cache_ivar,
@@ -1341,31 +1270,11 @@ int main(int argc, char **argv)
 
   printf("---------------------------------Starting of "
          "InstanceNormGradGPU!-------------------------------------\n");
-
-  DTYPE *dx_h = new DTYPE[N * C * D];
-  float *dgamma_h = new float[C];
-  float *dbeta_h = new float[C];
-  float *dl_dvars_h = (float *)malloc(N * C * sizeof(float));
-  float *dl_dmus_h = (float *)malloc(N * C * sizeof(float));
-  if (do_test)
-    InstanceNormGradCPUHelper(dy, x, gamma, N, C, D, epsilon, dgamma_h, dbeta_h,
-                              dx_h, dl_dvars_h, dl_dmus_h, is_channel_first);
-  if (allow_print)
-  {
-    Print2DHost(dgamma_h, 1, 1, C, "CPU dgamma:");
-    // Print2DHost(dbeta_h, 1, 1, C, "CPU dbeta:");
-    Print2DHost(dx_h, N, C, D, "CPU dx:");
-    Print2DHost(dl_dvars_h, N, C, 1, "CPU dl_dvars:");
-    Print2DHost(dl_dmus_h, N, C, 1, "CPU dl_dmus:");
-  }
-
   // use mean and ivar from CPU
-  if (do_test){
+  if (do_test)
     overwrite(cache_mean, cache_ivar, cache_mean_cpu, cache_ivar_cpu, N * C);
-    overwrite(dl_dvars, dl_dmus, dl_dvars_h, dl_dmus_h, N * C);
-  }
   InstanceNormGradGPU(dy, x, cache_mean, cache_ivar, gamma, N, C, D, dx, dgamma,
-                      dbeta, dl_dvars, dl_dmus, is_channel_first);
+                      dbeta, is_channel_first);
   // InstanceNormGradGPU(dy, x, cache_mean, cache_ivar, gamma, N, C, D, dx,
   // dgamma,
   //                     dbeta, is_channel_first);
@@ -1373,8 +1282,21 @@ int main(int argc, char **argv)
   {
     Print2D(dgamma, 1, 1, C, "GPU dgamma:");
     // Print2D(dbeta, 1, 1, C, "GPU dbeta:");
-    Print2D(dx, N, C, D, "GPU dx:");
+      Print2D(dx, N, C, D, "GPU dx:");
     //    Print2D(dy, N, C, D, "GPU dy:");
+  }
+
+  DTYPE *dx_h = new DTYPE[N * C * D];
+  float *dgamma_h = new float[C];
+  float *dbeta_h = new float[C];
+  if (do_test)
+    InstanceNormGradCPUHelper(dy, x, gamma, N, C, D, epsilon, dgamma_h, dbeta_h,
+                              dx_h, is_channel_first);
+  if (allow_print)
+  {
+    Print2DHost(dgamma_h, 1, 1, C, "CPU dgamma:");
+    // Print2DHost(dbeta_h, 1, 1, C, "CPU dbeta:");
+       Print2DHost(dx_h, N, C, D, "CPU dx:");
   }
 
   IsClose2D(dgamma, dgamma_h, 1, 1, C, "dgamma");
@@ -1384,7 +1306,6 @@ int main(int argc, char **argv)
   delete[] dx_h;
   delete[] dgamma_h;
   delete[] dbeta_h;
-
   // // ---- Backward Done Here ----
 
   checkCUDA(cudaFree(x));
@@ -1397,13 +1318,8 @@ int main(int argc, char **argv)
   checkCUDA(cudaFree(dbeta));
   checkCUDA(cudaFree(cache_mean));
   checkCUDA(cudaFree(cache_ivar));
-  checkCUDA(cudaFree(dl_dvars));
-  checkCUDA(cudaFree(dl_dmus));
-  
   free(cache_ivar_cpu);
   free(cache_mean_cpu);
-  free(dl_dmus_h);
-  free(dl_dvars_h);
   printf(
       "###################################################################\n");
 }
