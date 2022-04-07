@@ -445,7 +445,7 @@ void InstanceNormReductionsChannelFirst(
       (D <= min_num_blocks * kBlockSize * min_workload_per_thread);
   if (use_single_block)
   {
-    InstanceNormRowReduceInToOut<<<N, kBlockSize>>>(
+    InstanceNormRowReduceInToOut<<<NxC, kBlockSize>>>(
         x, NxC, D, temp_1, temp_2, op1, op2);
   }
   else
