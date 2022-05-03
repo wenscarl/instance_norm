@@ -1,4 +1,3 @@
-```
 # Instance Normalization
 This repo implements the Instance Normalization with different programming
 languages or libraries: Tensorflow (Keras), Numpy, C++, Eigen, CUDA. Each sample
@@ -61,4 +60,3 @@ Here we can view <img src="https://render.githubusercontent.com/render/math?math
 <img src="https://render.githubusercontent.com/render/math?math=\frac{\partial L}{\partial \mu}=\frac{\partial L}{\partial \mu}\cdot \frac{\partial \mu}{\partial \mu} %2B \frac{\partial L}{\partial \sigma^2}\cdot \frac{\partial \sigma^2}{\partial \mu}\\=\frac{\partial L}{\partial y}\cdot \frac{\partial y}{\partial \mu}\cdot 1 %2B \frac{\partial L}{\partial \sigma^2}\cdot \frac{\partial \sigma^2}{\partial \mu}\\=\sum_{i=1}^{D}dy\cdot \gamma \cdot\frac{-1}{\sqrt{\sigma^2%2B\epsilon}}%2B\sum_{i=1}^{D}\frac{\partial L}{\partial \sigma^2}\cdot \frac{1}{D}(-2)(x-\mu)">
 
 <img src="https://render.githubusercontent.com/render/math?math=\frac{\partial \mu}{\partial x}=\frac{1}{D}">
-```
